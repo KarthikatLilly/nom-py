@@ -1,0 +1,4 @@
+.venv\Scripts\Activate.ps1
+uvicorn app.main:app --reload --port 8001
+
+Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8001/mcp" -Method POST -ContentType "application/json" -Body '{"jsonrpc": "2.0", "id": 1, "method": "initialize"}'
