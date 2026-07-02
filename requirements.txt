@@ -4,3 +4,9 @@ pydantic
 httpx
 pyyaml
 python-dotenv
+
+sqlalchemy
+aiosqlite
+structlog
+pytest
+pytest-asyncio
