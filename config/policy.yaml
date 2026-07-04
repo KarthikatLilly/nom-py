@@ -1,0 +1,17 @@
+# nom-py policy configuration
+# Mirrors the structure of the Go NOM policy.yaml
+
+upstream:
+  endpoint: "http://localhost:9001/mcp"
+  auth: "none"                     # Phase 3 will add "oauth" mode
+
+github:
+  enabled: false                   # Phase 3 will enable this
+  callback_url: "http://localhost:8001/oauth/github/callback"
+
+auth:
+  enabled: false                   # Phase 3 will flip to true
+  admin_token: "nom-admin-secret"
+  tokens: {}                       # Phase 3 will add user tokens
+
+tools: {}                          # Phase 3 will add tool allow/deny rules

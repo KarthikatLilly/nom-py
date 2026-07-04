@@ -1,50 +1,19 @@
+"""
+MCP HTTP route — delegates all logic to the MCPDispatcher.
+"""
 from fastapi import APIRouter, Request
 
+from app.config import settings
+from app.mcp.dispatcher import MCPDispatcher
+from app.mcp.upstream import UpstreamClient
+
 router = APIRouter()
+
+_upstream = UpstreamClient(endpoint=settings.upstream_endpoint)
+_dispatcher = MCPDispatcher(upstream=_upstream)
 
 
 @router.post("/mcp")
 async def mcp_entry(request: Request):
     body = await request.json()
-    method = body.get("method")
-
-    if method == "initialize":
-        return {
-            "jsonrpc": "2.0",
-            "id": body.get("id"),
-            "result": {
-                "protocolVersion": "2025-03-26",
-                "capabilities": {
-                    "tools": {"listChanged": False}
-                },
-                "serverInfo": {
-                    "name": "nom-py",
-                    "version": "0.1.0"
-                }
-            }
-        }
-
-    if method == "tools/list":
-        return {
-            "jsonrpc": "2.0",
-            "id": body.get("id"),
-            "result": {"tools": []}
-        }
-
-    if method == "tools/call":
-        return {
-            "jsonrpc": "2.0",
-            "id": body.get("id"),
-            "result": {
-                "content": [
-                    {"type": "text", "text": "NOM-py stub response"}
-                ],
-                "isError": False
-            }
-        }
-
-    return {
-        "jsonrpc": "2.0",
-        "id": body.get("id"),
-        "error": {"code": -32601, "message": f"Unknown method: {method}"}
-    }
+    return await _dispatcher.handle(body)
