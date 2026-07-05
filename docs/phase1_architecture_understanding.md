@@ -2,6 +2,20 @@
 
 ## What is NOM?
 
+NOM is not a protocol. It's an infrastructure component.
+NOM speaks MCP on both sides:
+•	to the agent → it looks like an MCP server
+•	to the real tools → it looks like an MCP client
+But in the middle, NOM inserts logic that MCP itself doesn’t define:
+•	authentication
+•	authorization (who can do what)
+•	policy enforcement
+•	audit logging
+•	rate limiting
+•	guardrails on risky actions
+•	routing to the right upstream
+•	idempotency & revert
+•	observability (metrics, tracing)
 
 
 ## Goal
