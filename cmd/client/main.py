@@ -1,7 +1,7 @@
 """
-Dummy MCP client for testing nom-py end-to-end.
+Dummy MCP client for testing nom-py end-to-end with different users.
 
-Run (after nom-py and dummy upstream are running):
+Run:
     python cmd/client/main.py
 """
 import asyncio
@@ -12,46 +12,49 @@ import httpx
 NOM_URL = "http://localhost:8001/mcp"
 
 
-async def call(client: httpx.AsyncClient, payload: dict) -> dict:
-    r = await client.post(NOM_URL, json=payload)
+async def call(client: httpx.AsyncClient, payload: dict, token: str | None = None) -> dict:
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    r = await client.post(NOM_URL, json=payload, headers=headers)
     return r.json()
+
+
+async def scenario(client: httpx.AsyncClient, label: str, token: str | None):
+    print(f"\n{'='*60}")
+    print(f"  SCENARIO: {label}  (token={token or 'NONE'})")
+    print("="*60)
+
+    print("\n--- initialize ---")
+    print(json.dumps(await call(client, {
+        "jsonrpc": "2.0", "id": 1, "method": "initialize"
+    }, token), indent=2))
+
+    print("\n--- tools/list ---")
+    print(json.dumps(await call(client, {
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list"
+    }, token), indent=2))
+
+    for tool_id, (name, args) in enumerate([
+        ("get_weather", {"location": "Hyderabad"}),
+        ("list_users", {}),
+        ("delete_user", {"user_id": "alice"}),
+    ], start=3):
+        print(f"\n--- tools/call: {name} ---")
+        print(json.dumps(await call(client, {
+            "jsonrpc": "2.0",
+            "id": tool_id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": args},
+        }, token), indent=2))
 
 
 async def main() -> None:
     async with httpx.AsyncClient(timeout=10.0) as client:
-        print("--- 1. initialize ---")
-        print(json.dumps(await call(client, {
-            "jsonrpc": "2.0", "id": 1, "method": "initialize"
-        }), indent=2))
-
-        print("\n--- 2. tools/list ---")
-        print(json.dumps(await call(client, {
-            "jsonrpc": "2.0", "id": 2, "method": "tools/list"
-        }), indent=2))
-
-        print("\n--- 3. tools/call: get_weather ---")
-        print(json.dumps(await call(client, {
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "tools/call",
-            "params": {"name": "get_weather", "arguments": {"location": "Hyderabad"}},
-        }), indent=2))
-
-        print("\n--- 4. tools/call: list_users ---")
-        print(json.dumps(await call(client, {
-            "jsonrpc": "2.0",
-            "id": 4,
-            "method": "tools/call",
-            "params": {"name": "list_users", "arguments": {}},
-        }), indent=2))
-
-        print("\n--- 5. tools/call: delete_user ---")
-        print(json.dumps(await call(client, {
-            "jsonrpc": "2.0",
-            "id": 5,
-            "method": "tools/call",
-            "params": {"name": "delete_user", "arguments": {"user_id": "alice"}},
-        }), indent=2))
+        await scenario(client, "NO TOKEN", None)
+        await scenario(client, "ALICE (developers + analysts)", "tok-alice")
+        await scenario(client, "BOB (analysts only)", "tok-bob")
+        await scenario(client, "INVALID TOKEN", "tok-nobody")
 
 
 if __name__ == "__main__":

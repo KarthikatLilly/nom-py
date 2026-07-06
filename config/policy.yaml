@@ -1,17 +1,37 @@
 # nom-py policy configuration
-# Mirrors the structure of the Go NOM policy.yaml
 
 upstream:
   endpoint: "http://localhost:9001/mcp"
-  auth: "none"                     # Phase 3 will add "oauth" mode
+  auth: "none"
 
 github:
-  enabled: false                   # Phase 3 will enable this
+  enabled: false
   callback_url: "http://localhost:8001/oauth/github/callback"
 
 auth:
-  enabled: false                   # Phase 3 will flip to true
+  enabled: true
   admin_token: "nom-admin-secret"
-  tokens: {}                       # Phase 3 will add user tokens
+  tokens:
+    "tok-alice":
+      user_id: "alice"
+      groups: ["developers", "analysts"]
+    "tok-bob":
+      user_id: "bob"
+      groups: ["analysts"]
 
-tools: {}                          # Phase 3 will add tool allow/deny rules
+tools:
+  get_weather:
+    allow: true
+    allowed_groups: ["developers"]
+
+  list_users:
+    allow: true
+    allowed_groups: ["analysts"]
+
+  delete_user:
+    allow: false
+    reason: "destructive operations not permitted via this gateway"
+
+  admin_reset:
+    allow: false
+    reason: "admin tools restricted to internal services only"

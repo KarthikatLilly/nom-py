@@ -22,6 +22,18 @@ class Settings:
         return self._policy.get("upstream", {}).get("endpoint", "")
 
     @property
+    def auth_enabled(self) -> bool:
+        return self._policy.get("auth", {}).get("enabled", False)
+
+    @property
+    def tokens(self) -> dict[str, dict[str, Any]]:
+        return self._policy.get("auth", {}).get("tokens", {})
+
+    @property
+    def tool_rules(self) -> dict[str, dict[str, Any]]:
+        return self._policy.get("tools", {})
+
+    @property
     def raw(self) -> dict[str, Any]:
         return self._policy
 
