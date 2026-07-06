@@ -1,8 +1,8 @@
 """
-NOM Python Prototype - Application entry point.
+NOM Python Prototype — Application entry point.
 
 Run:
-    uvicorn app.main:app --reload
+    uvicorn app.main:app --reload --port 8001
 """
 import logging
 from contextlib import asynccontextmanager
@@ -17,13 +17,15 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("NOM-py starting up")
+    logger.info("nom-py starting up")
     yield
-    logger.info("NOM-py shutting down")
+    logger.info("nom-py shutting down")
 
 
 app = FastAPI(
     title="nom-py",
+    description="Policy-enforcing MCP proxy (Phase 2: core flow)",
+    version="0.2.0",
     lifespan=lifespan,
     debug=True,
 )
