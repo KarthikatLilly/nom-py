@@ -3,9 +3,10 @@ MCP HTTP route — delegates all logic to the MCPDispatcher.
 """
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response
 from pydantic import BaseModel, ConfigDict
 
+from app.auth.models import Principal
 from app.auth.token_auth import authenticate, AuthError
 from app.config import settings
 from app.mcp.dispatcher import MCPDispatcher
@@ -33,29 +34,36 @@ class MCPRequest(BaseModel):
 
 
 @router.post("/mcp", summary="MCP JSON-RPC entrypoint")
-async def mcp_entry(body: MCPRequest, request: Request) -> dict[str, Any]:
+async def mcp_entry(body: MCPRequest, request: Request):
     payload = body.model_dump(exclude_none=True)
     ctx = RequestContext(method=payload.get("method", ""))
 
+    # JSON-RPC notifications have no "id" field — server must not respond
+    is_notification = "id" not in payload
+
     try:
-        # Skip auth for `initialize` — the client hasn't authenticated yet
-        if payload.get("method") == "initialize":
-            # Use a stub principal so dispatcher signature stays consistent
-            from app.auth.models import Principal
-            anonymous = Principal(user_id="anonymous", groups=[])
-            ctx.principal = anonymous
-            return await _dispatcher.handle(payload, anonymous, ctx)
+        # initialize and notifications skip auth — lifecycle signals, not tool calls
+        if payload.get("method") == "initialize" or is_notification:
+            principal = Principal(user_id="anonymous", groups=[])
+            ctx.principal = principal
+        else:
+            try:
+                principal = await authenticate(request, payload, ctx)
+                ctx.principal = principal
+            except AuthError as e:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": payload.get("id"),
+                    "error": {"code": e.code, "message": e.message},
+                }
 
-        try:
-            principal = await authenticate(request, payload, ctx)
-        except AuthError as e:
-            return {
-                "jsonrpc": "2.0",
-                "id": payload.get("id"),
-                "error": {"code": e.code, "message": e.message},
-            }
+        result = await _dispatcher.handle(payload, principal, ctx)
 
-        ctx.principal = principal
-        return await _dispatcher.handle(payload, principal, ctx)
+        # Notifications MUST NOT have a response body
+        if is_notification:
+            return Response(status_code=204)
+
+        return result
     finally:
+        audit.emit(ctx)
         audit.emit(ctx)

@@ -28,9 +28,10 @@ class MCPDispatcher:
 
     async def handle(
         self, msg: dict[str, Any], principal: Principal, ctx=None
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         method = msg.get("method")
         msg_id = msg.get("id")
+        is_notification = msg_id is None
 
         logger.info(
             "MCP request: method=%s id=%s user=%s",
@@ -43,11 +44,23 @@ class MCPDispatcher:
             result = await self._handle_tools_list(msg, principal, ctx)
         elif method == "tools/call":
             result = await self._handle_tools_call(msg, principal, ctx)
+        elif is_notification:
+            # Notifications are fire-and-forget lifecycle signals — log and drop
+            logger.info("Notification received: %s (ignored)", method)
+            if ctx is not None:
+                ctx.record("notification.received", method=method)
+            result = None
         else:
             result = self._error(msg_id, -32601, f"Method not supported: {method}")
 
         if ctx is not None:
-            ctx.record("dispatch.complete", outcome="error" if "error" in result else "ok")
+            if is_notification:
+                outcome = "notification"
+            elif result and "error" in result:
+                outcome = "error"
+            else:
+                outcome = "ok"
+            ctx.record("dispatch.complete", outcome=outcome)
         return result
 
     async def _handle_initialize(self, msg: dict[str, Any], ctx=None) -> dict[str, Any]:
@@ -55,8 +68,11 @@ class MCPDispatcher:
         if "result" in upstream_result:
             upstream_result["result"]["serverInfo"] = {
                 "name": "nom-py",
-                "version": "0.3.0",
+                "version": "0.4.0",
             }
+            # Guarantee capabilities.tools is present even if upstream omits it
+            if "capabilities" not in upstream_result["result"]:
+                upstream_result["result"]["capabilities"] = {"tools": {}}
         return upstream_result
 
     async def _handle_tools_list(
@@ -82,15 +98,19 @@ class MCPDispatcher:
             return self._error(msg.get("id"), e.code, str(e))
 
         rule = self.policy.rules.get(tool_name, {})
-        idempotency_key = None
 
-        if rule.get("mutating"):
-            idempotency_key = self.idempotency.key_for(
-                principal.user_id,
-                tool_name,
-                args,
-                params.get("idempotency_key"),
-            )
+        if not rule.get("mutating"):
+            # Read-only tool — forward directly, no idempotency overhead
+            return await self.upstream.forward(msg, ctx)
+
+        # Mutating tool — serialise concurrent identical calls under a per-key lock
+        idempotency_key = self.idempotency.key_for(
+            principal.user_id,
+            tool_name,
+            args,
+            params.get("idempotency_key"),
+        )
+        async with self.idempotency.lock_for(idempotency_key):
             cached = self.idempotency.get(idempotency_key)
             if cached:
                 if ctx is not None:
@@ -99,10 +119,11 @@ class MCPDispatcher:
             if ctx is not None:
                 ctx.record("idempotency.miss", key=idempotency_key)
 
-        result = await self.upstream.forward(msg, ctx)
+            result = await self.upstream.forward(msg, ctx)
 
-        if idempotency_key is not None:
-            self.idempotency.put(idempotency_key, result)
+            # Only cache confirmed successes — never persist upstream errors
+            if "error" not in result:
+                self.idempotency.put(idempotency_key, result)
 
         return result
 

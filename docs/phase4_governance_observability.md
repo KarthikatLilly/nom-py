@@ -506,6 +506,88 @@ Every stage that ran appears in the record. Every stage that didn't run is absen
 
 ---
 
+## � Idempotency hardening (post-Phase 4 fixes)
+
+After Phase 4 testing, three correctness bugs were identified and fixed in
+`app/safety/idempotency.py` and `app/mcp/dispatcher.py`.
+
+### Fix 1 — Canonical key hashing
+
+**Bug:** `json.dumps` default separators include whitespace (`", "` and `": "`).
+Two clients sending semantically identical args with different serializers produce
+different strings → different SHA-256 keys → both get a cache miss and both hit upstream.
+
+**Fix:** `separators=(",", ":")` added to `json.dumps`.
+```python
+canonical = json.dumps({...}, sort_keys=True, separators=(",", ":"))
+```
+Now `{"user_id":"bob","reason":"x"}` and `{"reason":"x","user_id":"bob"}` always hash
+to the same key regardless of client-side dict ordering or JSON library.
+
+---
+
+### Fix 2 — Concurrency guard (TOCTOU race)
+
+**Bug:** Two simultaneous identical requests both call `get(key)` before either calls
+`put(key, result)`. Both see a miss, both forward to upstream, mutating action runs twice.
+Classic TOCTOU (Time Of Check to Time Of Use) window.
+
+**Fix:** `asyncio.Lock` per key, held from `get` through `put`.
+```python
+async with self.idempotency.lock_for(idempotency_key):
+    cached = self.idempotency.get(key)
+    if cached:
+        return cached
+    result = await self.upstream.forward(msg, ctx)
+    if "error" not in result:
+        self.idempotency.put(key, result)
+```
+Request B blocks while Request A executes. When A releases the lock, B acquires it,
+gets a hit, and serves from cache. Upstream called exactly once. No meta-lock needed —
+asyncio is single-threaded; `lock_for` has no `await` so `dict.setdefault` is atomic.
+
+---
+
+### Fix 3 — Never cache upstream errors
+
+**Bug:** Original code cached the result unconditionally. If upstream returned a
+JSON-RPC error (`{"error": ...}`), that error was stored. Every subsequent retry
+received the cached error instantly — the mutating action never re-attempted, even
+after upstream recovered.
+
+**Fix:** Only cache on confirmed success.
+```python
+if "error" not in result:
+    self.idempotency.put(idempotency_key, result)
+```
+Failure → not cached → next retry re-executes → if upstream now succeeds → cached.
+Success is memoized. Errors are always retryable.
+
+---
+
+### Bonus — Read-only early return
+
+**Cleanup:** Read-only tools (`mutating: false`) now take a fast path in the dispatcher
+that skips the entire idempotency block — no key computation, no lock, no cache lookup.
+```python
+if not rule.get("mutating"):
+    return await self.upstream.forward(msg, ctx)
+```
+Matches the Test C2 intent and makes the mutating vs read-only split explicit in code shape.
+
+---
+
+### Before / after
+
+| Scenario | Before | After |
+|---|---|---|
+| Same call, reordered args | Two different keys → both hit upstream | Same key → second served from cache ✅ |
+| Two simultaneous mutating calls | Both miss, both hit upstream | One executes, one waits, served from cache ✅ |
+| Upstream call fails | Error cached forever, retries served the error | Not cached, retry re-executes ✅ |
+| Read-only call | Went through idempotency check | Skipped entirely ✅ |
+
+---
+
 ## 📊 Phase summary
 
 | Layer | Phase | Status |
@@ -514,4 +596,5 @@ Every stage that ran appears in the record. Every stage that didn't run is absen
 | MCP forwarding pipeline | 2 | ✅ |
 | Token auth + policy | 3 | ✅ |
 | Audit stream + idempotency + revert metadata | 4 | ✅ |
+| Idempotency hardening (canonical key, lock, error-safe) | 4.1 | ✅ |
 | GitHub OAuth + Claude Desktop bridge + demo | 5 | ⏭️ Next |
