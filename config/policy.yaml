@@ -22,16 +22,31 @@ auth:
 tools:
   get_weather:
     allow: true
-    allowed_groups: ["developers"]
+    allowed_groups: ["developers", "admin"]
+    mutating: false
 
   list_users:
     allow: true
-    allowed_groups: ["analysts"]
+    allowed_groups: ["analysts", "admin"]
+    mutating: false
 
   delete_user:
-    allow: false
+    allow: false     # put true for idempotency check
+    allowed_groups: ["developers", "admin"]
     reason: "destructive operations not permitted via this gateway"
+    mutating: true
+    revertible: false
 
   admin_reset:
     allow: false
     reason: "admin tools restricted to internal services only"
+    mutating: true
+    revertible: false
+
+  # Example future tool — shows compensating_tool pattern
+  create_bucket:
+    allow: true
+    allowed_groups: ["developers"]
+    mutating: true
+    revertible: true
+    compensating_tool: "delete_bucket"

@@ -26,6 +26,10 @@ class Settings:
         return self._policy.get("auth", {}).get("enabled", False)
 
     @property
+    def admin_token(self) -> str:
+        return self._policy.get("auth", {}).get("admin_token", "")
+
+    @property
     def tokens(self) -> dict[str, dict[str, Any]]:
         return self._policy.get("auth", {}).get("tokens", {})
 

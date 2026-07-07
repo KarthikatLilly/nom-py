@@ -10,6 +10,8 @@ from app.auth.token_auth import authenticate, AuthError
 from app.config import settings
 from app.mcp.dispatcher import MCPDispatcher
 from app.mcp.upstream import UpstreamClient
+from app.observability import audit
+from app.observability.context import RequestContext
 from app.policy.engine import PolicyEngine
 
 router = APIRouter()
@@ -33,21 +35,27 @@ class MCPRequest(BaseModel):
 @router.post("/mcp", summary="MCP JSON-RPC entrypoint")
 async def mcp_entry(body: MCPRequest, request: Request) -> dict[str, Any]:
     payload = body.model_dump(exclude_none=True)
-
-    # Skip auth for `initialize` — the client hasn't authenticated yet
-    if payload.get("method") == "initialize":
-        # Use a stub principal so dispatcher signature stays consistent
-        from app.auth.models import Principal
-        anonymous = Principal(user_id="anonymous", groups=[])
-        return await _dispatcher.handle(payload, anonymous)
+    ctx = RequestContext(method=payload.get("method", ""))
 
     try:
-        principal = await authenticate(request, payload)
-    except AuthError as e:
-        return {
-            "jsonrpc": "2.0",
-            "id": payload.get("id"),
-            "error": {"code": e.code, "message": e.message},
-        }
+        # Skip auth for `initialize` — the client hasn't authenticated yet
+        if payload.get("method") == "initialize":
+            # Use a stub principal so dispatcher signature stays consistent
+            from app.auth.models import Principal
+            anonymous = Principal(user_id="anonymous", groups=[])
+            ctx.principal = anonymous
+            return await _dispatcher.handle(payload, anonymous, ctx)
 
-    return await _dispatcher.handle(payload, principal)
+        try:
+            principal = await authenticate(request, payload, ctx)
+        except AuthError as e:
+            return {
+                "jsonrpc": "2.0",
+                "id": payload.get("id"),
+                "error": {"code": e.code, "message": e.message},
+            }
+
+        ctx.principal = principal
+        return await _dispatcher.handle(payload, principal, ctx)
+    finally:
+        audit.emit(ctx)

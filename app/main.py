@@ -12,6 +12,10 @@ from fastapi import FastAPI
 from app.api.routes.health import router as health_router
 from app.api.routes.mcp import router as mcp_router
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 
