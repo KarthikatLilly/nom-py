@@ -218,13 +218,48 @@ Claude Desktop is configured with **two separate entries** pointing at the same 
 
 This demonstrates identity-aware catalog filtering: same gateway, same upstream, same policy config — but each client receives only the tools their identity is permitted to use. Unauthorized tools are invisible to the client, not merely rejected at call time.
 
-To write the Claude Desktop config (Windows MSIX path):
+### Writing the config (first time)
 
-```powershell
-scripts\setup_claude_config.ps1
+Claude Desktop on Windows is an MSIX sandbox app. Its config lives at a path like:
+
+```
+%LOCALAPPDATA%\Packages\Claude_<hash>\LocalCache\Roaming\Claude\claude_desktop_config.json
 ```
 
-After writing → fully restart Claude Desktop (system tray → Quit → relaunch).
+Writing to `%APPDATA%\Claude\` is silently ignored. Use the restore script instead — it auto-detects the correct path.
+
+### Restoring the config (when Claude wipes it)
+
+Claude Desktop occasionally resets its `mcpServers` config on update or reinstall. When that happens, run:
+
+```powershell
+cd C:\Users\L132478\nom-py
+.\scripts\restore_claude_config.ps1
+```
+
+The script is **idempotent** — safe to run at any time. It:
+- Auto-detects the MSIX sandbox path (adapts if the package hash changes)
+- Preserves all existing Claude preferences (only overwrites `mcpServers`)
+- Writes BOM-free UTF-8 (Claude silently fails to parse BOM-prefixed files)
+- Adds all three servers: `nom-py-alice`, `nom-py-bob`, `incident-responder`
+
+What the script does under the hood:
+
+```powershell
+# 1. Auto-detect MSIX path
+$claudePkg = Get-ChildItem "$env:LOCALAPPDATA\Packages" -Directory -Filter "Claude_*" |
+    Select-Object -First 1 -ExpandProperty FullName
+$configPath = Join-Path $claudePkg "LocalCache\Roaming\Claude\claude_desktop_config.json"
+
+# 2. Load existing config (preserves preferences), merge mcpServers
+$existing = Get-Content $configPath -Raw | ConvertFrom-Json
+$existing | Add-Member -MemberType NoteProperty -Name mcpServers -Value $mcpServers -Force
+
+# 3. Write BOM-free UTF-8
+[System.IO.File]::WriteAllText($configPath, $outputJson, [System.Text.UTF8Encoding]::new($false))
+```
+
+After running → fully restart Claude Desktop (system tray → Quit → relaunch).
 
 ---
 
