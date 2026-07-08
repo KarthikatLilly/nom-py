@@ -12,13 +12,11 @@
 
 When AI agents (such as Claude, Copilot, or Cortex agents) need to use tools, they should not connect directly to every tool server. They connect to one gateway — NOM — which handles authentication, authorization, auditing, and safety guardrails, then forwards the call to the correct upstream tool server.
 
-NOM acts as the single enforcement point for all AI-to-tool traffic: authentication, policy evaluation, audit logging, and routing.
+NOM acts as the single enforcement point for all AI-to-tool traffic.
 
 ---
 
 ## NOM vs MCP
-
-NOM and MCP are not the same thing.
 
 | | **MCP** | **NOM** |
 |---|---|---|
@@ -27,14 +25,7 @@ NOM and MCP are not the same thing.
 | Provides | Message schema (`initialize`, `tools/list`, `tools/call`) | Auth, policy, audit, guardrails, routing |
 | Analogy | The road | The toll booth on the road |
 
-- **MCP** defines how agents and tools speak to each other.
-- **NOM** governs and mediates that conversation.
-
-NOM speaks MCP on both sides:
-- Toward the agent — it presents as an MCP server.
-- Toward upstream tools — it behaves as an MCP client.
-
-In between, NOM adds everything MCP omits: authentication, authorization, policy enforcement, audit logging, rate limiting, guardrails on destructive actions, upstream routing, idempotency, and observability.
+NOM speaks MCP on both sides — it presents as an MCP server to agents and behaves as an MCP client toward upstream tools. In between, NOM adds everything MCP omits: identity, authorization, policy filtering, structured audit logging, and safety metadata.
 
 ---
 
@@ -48,192 +39,283 @@ In between, NOM adds everything MCP omits: authentication, authorization, policy
 [ AI Agent ] <-- MCP --> [ Tool Server 3 ]
 ```
 
-Problems: separate auth per server, no unified audit, no central policy, no way to block risky tool calls, fragmented tool discovery.
+Problems: separate auth per server, no unified audit, no central policy, no way to block risky tool calls.
 
 ### With NOM
 
 ```
-           [ AI Agent ]
-                |
-           speaks MCP
-                v
-    [ NOM Gateway (also speaks MCP) ]
-    auth -> policy -> audit -> guardrails
-                |
-     +----------+----------+
-     v          v          v
- [Tool 1]   [Tool 2]   [Tool 3]
+              [ AI Agent ]
+                   |
+              speaks MCP
+                   ▼
+       [ NOM Gateway :8001 ]
+    auth → policy → audit → guardrails
+                   |
+      +------------+------------+
+      ▼            ▼            ▼
+  [Tool 1]     [Tool 2]     [Tool 3]
+  upstream :9001
 ```
 
-Result: one endpoint, one auth model, one policy engine, one audit log, one place to evaluate and potentially block tool calls.
+Result: one endpoint, one auth model, one policy engine, one audit log — regardless of how many upstream tool servers exist.
 
 ---
 
-## Envoy Inspiration
+## What has been built (Phases 1–5)
 
-Envoy is a general-purpose Layer 7 proxy that adds routing, load balancing, TLS termination, and observability between services. NOM borrows Envoy's core ideas:
+### Phase 1 — Scaffold
+FastAPI app, `/health` and `/mcp` routes, uvicorn boot, basic request flow.
 
-- **Filter chain** — every request passes through: auth → policy → audit → route
-- **Upstream routing** — determines which tool server handles the call
-- **Observability** — structured logs, metrics, and traces on every decision
+### Phase 2 — MCP forwarding pipeline
+Full `tools/list` and `tools/call` proxying to upstream. nom-py receives a JSON-RPC request, forwards it via `httpx`, returns the upstream response verbatim.
 
-The key difference: Envoy is a generic HTTP gateway. NOM is an MCP-aware gateway designed specifically for AI agent traffic.
+### Phase 3 — Token auth + policy enforcement
+Every request passes through three gates before it reaches the upstream:
 
----
-
-## Why FastAPI?
-
-The original NOM uses Go's `net/http`. This Python port uses FastAPI for the following reasons:
-
-| Framework | Assessment |
-|---|---|
-| Flask | Synchronous, no native async support |
-| Django | Overly heavy for a proxy workload |
-| Starlette | Low-level, less ergonomic |
-| **FastAPI** | Async-native, JSON-first, strong typing, middleware support |
-
-FastAPI is well-suited to NOM's requirements:
-- MCP uses JSON-RPC over HTTP — FastAPI handles JSON natively.
-- NOM proxies to upstream MCP servers — requires async HTTP (`httpx`).
-- NOM has a middleware chain (auth → policy → audit) — maps directly to FastAPI middleware.
-- FastAPI generates interactive Swagger docs automatically at `/docs`.
-
----
-
-## Project Scope
-
-This is a prototype intended to validate the architecture. It is not production-ready.
-
-**In scope:**
-- Single `/mcp` endpoint implementing MCP JSON-RPC
-- YAML-defined registry of upstream MCP servers
-- Auth layer (GitHub OAuth, provider-abstracted)
-- Policy engine (YAML rules: allow / deny / approval-required)
-- Audit log for every tool call decision
-- Idempotency keys for mutating operations
-- Revert/compensation metadata for reversible actions
-- Guardrails against destructive or high-risk tool calls
-
-**Out of scope (for now):**
-- Production-grade performance tuning
-- Full enterprise on-behalf-of (OBO) auth
-- Complete MCP specification coverage
-- Dynamic service discovery
-- SSE / advanced streaming
-- High availability / horizontal scaling
-
----
-
-## Getting Started
-
-### 1. Setup
-
-```bash
-python -m venv .venv
-
-# Windows
-.venv\Scripts\Activate.ps1
-
-# macOS / Linux
-source .venv/bin/activate
-
-pip install -r requirements.txt
+```
+Client → [Auth Gate] → [Identity Gate] → [Policy Gate] → Upstream
 ```
 
-### 2. Run the server
+- **Auth gate** — extracts `Authorization: Bearer <token>` from header, body, or query param. Missing or unknown token → rejected.
+- **Identity gate** — looks up token in `config/policy.yaml`, attaches `user_id` + `groups` as a `Principal`.
+- **Policy gate** — checks `tools.<name>.allow` and `allowed_groups`. Not allowed → rejected.
 
-```bash
+`tools/list` is also filtered: users only see tools they are permitted to call. Forbidden tools are invisible, not just blocked.
+
+### Phase 4 — Audit stream + idempotency + revert metadata
+Every request emits one structured JSON audit record with per-stage timing:
+
+```
+auth.extract → auth.lookup → policy.evaluate → safety.revertible
+→ idempotency.miss/hit → upstream.call → dispatch.complete
+```
+
+Idempotency: mutating tools replay cached results for duplicate requests (keyed on `request_id`). Revert metadata (`mutating`, `revertible`, `compensating_tool`) is declared per-tool in `policy.yaml` and recorded in every audit event.
+
+### Phase 5 — stdio bridge + Claude Desktop integration
+A thin translation shim (`cmd/stdio_bridge/main.py`) lets stdio-only MCP clients (such as Claude Desktop) talk to nom-py's HTTP interface. nom-py itself was not modified — the bridge is 100% transport translation.
+
+The bridge reads JSON-RPC from stdin, POSTs to nom-py with an injected `Authorization: Bearer` token, and writes responses to stdout. All logs go to stderr so Claude's parser is never confused.
+
+---
+
+## Running the project
+
+nom-py requires **two processes** running simultaneously:
+
+### Port 9001 — upstream mock tool server
+
+```powershell
+uvicorn cmd.upstream.main:app --reload --port 9001
+```
+
+This is a lightweight mock MCP server that exposes three tools: `get_weather`, `list_users`, and `delete_user`. In production this would be a real tool server.
+
+### Port 8001 — nom-py gateway
+
+```powershell
 uvicorn app.main:app --reload --port 8001
 ```
 
-### 3. Test the endpoints
+This is the governed gateway. All client traffic goes here. nom-py enforces auth, policy, and audit before forwarding to upstream :9001.
 
-**Health check:**
-
-```powershell
-curl http://localhost:8001/health
-# Expected: {"status":"ok","service":"nom-py"}
-```
-
-**MCP handshake (PowerShell):**
+### Quick smoke test (no Claude Desktop needed)
 
 ```powershell
-Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8001/mcp" `
-  -Method POST `
-  -ContentType "application/json" `
-  -Body '{"jsonrpc":"2.0","id":1,"method":"initialize"}'
+.venv\Scripts\Activate.ps1
+
+$env:NOM_URL   = "http://localhost:8001/mcp"
+$env:NOM_TOKEN = "tok-alice"
+
+Get-Content cmd\stdio_bridge\test_handshake.txt | python cmd\stdio_bridge\main.py
 ```
 
-Expected response:
+---
+
+## Token identities
+
+Tokens are configured in `config/policy.yaml`:
+
+| Token | User | Groups | Can call |
+|---|---|---|---|
+| `tok-alice` | alice | developers, analysts | `get_weather`, `list_users` |
+| `tok-bob` | bob | analysts | `list_users` only |
+| `nom-admin-secret` | (admin) | admin | all permitted tools |
+| _(no token)_ | — | — | rejected at auth gate |
+
+---
+
+## Policy configuration (`config/policy.yaml`)
+
+```yaml
+tools:
+  get_weather:
+    allow: true
+    allowed_groups: ["developers", "admin"]
+    mutating: false
+
+  list_users:
+    allow: true
+    allowed_groups: ["analysts", "admin"]
+    mutating: false
+
+  delete_user:
+    allow: false          # globally denied
+    reason: "destructive operations not permitted via this gateway"
+    mutating: true
+    revertible: false
+```
+
+Tools with `allow: false` are stripped from `tools/list` responses — clients never learn they exist.
+
+---
+
+## Claude Desktop integration
+
+nom-py ships with a stdio bridge that allows any stdio-only MCP client to connect to the HTTP gateway. Claude Desktop is the reference integration.
+
+### How it works
+
+```
+Claude Desktop
+    │  spawns process
+    ▼
+cmd/stdio_bridge/main.py
+    │  stdin  → JSON-RPC line
+    │  POST http://localhost:8001/mcp  (Authorization: Bearer <token>)
+    │  response → stdout
+    ▼
+nom-py :8001  →  enforce auth + policy + audit  →  upstream :9001
+```
+
+### Two MCP connectors — one gateway, two identities
+
+Claude Desktop is configured with **two separate entries** pointing at the same nom-py gateway, each carrying a different token:
 
 ```json
 {
-  "jsonrpc": "2.0",
-  "id": 1,
-  "result": {
-    "protocolVersion": "2025-03-26",
-    "capabilities": { "tools": { "listChanged": false } },
-    "serverInfo": { "name": "nom-py", "version": "0.1.0" }
+  "mcpServers": {
+    "nom-py-alice": {
+      "command": "C:\\...\\python.exe",
+      "args": ["C:\\...\\cmd\\stdio_bridge\\main.py"],
+      "env": { "NOM_URL": "http://localhost:8001/mcp", "NOM_TOKEN": "tok-alice", ... }
+    },
+    "nom-py-bob": {
+      "command": "C:\\...\\python.exe",
+      "args": ["C:\\...\\cmd\\stdio_bridge\\main.py"],
+      "env": { "NOM_URL": "http://localhost:8001/mcp", "NOM_TOKEN": "tok-bob", ... }
+    }
   }
 }
 ```
 
-This is the standard MCP server handshake: the gateway identifies its protocol version, capabilities, and server identity.
+**Why two connectors?**
 
-### 4. Interactive docs
-
-Open [http://localhost:8001/docs](http://localhost:8001/docs) for the auto-generated Swagger UI.
-
----
-
-## Repository Layout
-
-```
-nom-py/
-├── app/
-│   ├── main.py                # FastAPI app entry point
-│   ├── config.py              # App configuration
-│   ├── api/routes/            # HTTP routes (/health, /mcp)
-│   ├── mcp/                   # MCP dispatcher, registry, upstream adapters
-│   ├── auth/                  # Authentication (GitHub OAuth)
-│   ├── policy/                # YAML-driven policy engine
-│   ├── observability/         # Audit logging and structured observability
-│   ├── safety/                # Idempotency and compensating actions
-│   └── models/                # Data models
-├── config/
-│   ├── servers.yaml           # Upstream MCP server registry
-│   ├── policy.yaml            # RBAC and approval rules
-│   └── aws.yaml               # AWS-specific guardrail configuration
-├── docs/                      # Phase-by-phase architecture notes
-├── tests/
-├── requirements.txt
-└── README.md
-```
-
----
-
-## Roadmap
-
-| Phase | Focus | Deliverable |
+| Connector | Token | What Claude sees |
 |---|---|---|
-| 1 | Architecture understanding | Map Go NOM concepts to Python equivalents |
-| 2 | MCP core flow | Working `/mcp` with `initialize`, `tools/list`, `tools/call` |
-| 3 | Auth and policy | GitHub OAuth + YAML policy engine |
-| 4 | Audit, idempotency, revert | Full decision trail and compensating actions |
-| 5 | Guardrails and demo | End-to-end demo with real tool scenarios |
+| `nom-py-alice` | `tok-alice` (developers + analysts) | `get_weather` + `list_users` |
+| `nom-py-bob` | `tok-bob` (analysts only) | `list_users` only |
 
-Each phase has a corresponding document in `docs/`.
+This demonstrates identity-aware catalog filtering: same gateway, same upstream, same policy config — but each client receives only the tools their identity is permitted to use. Unauthorized tools are invisible to the client, not merely rejected at call time.
+
+To write the Claude Desktop config (Windows MSIX path):
+
+```powershell
+scripts\setup_claude_config.ps1
+```
+
+After writing → fully restart Claude Desktop (system tray → Quit → relaunch).
 
 ---
 
-## Summary
+## Audit log format
 
-**nom-py is a governed MCP broker, ported from Go to Python, that exposes a single safe tool surface to AI agents and treats every tool call as an auditable, policy-evaluated, and potentially reversible operation.**
+Every request produces one JSON line on `nom-py.audit`:
+
+```json
+{
+  "request_id": "e813c93d-...",
+  "user_id": "alice",
+  "method": "tools/call",
+  "duration_ms": 268.41,
+  "events": [
+    { "stage": "auth.extract",      "t_ms": 0.01, "source": "header", "found": true },
+    { "stage": "auth.lookup",       "t_ms": 0.03, "token_hint": "tok-al…", "result": "ok" },
+    { "stage": "policy.evaluate",   "t_ms": 0.24, "tool": "get_weather", "decision": "allow" },
+    { "stage": "safety.revertible", "t_ms": 0.24, "mutating": false },
+    { "stage": "upstream.call",     "t_ms": 268.35, "latency_ms": 268.03, "status": 200 },
+    { "stage": "dispatch.complete", "t_ms": 268.37, "outcome": "ok" }
+  ]
+}
+```
+
+A policy denial short-circuits at `policy.evaluate` — `upstream.call` is absent, and total duration is under 1ms.
 
 ---
 
-## References
+## Project structure
 
-- [Model Context Protocol Specification](https://modelcontextprotocol.io)
-- [Envoy Proxy Architecture](https://www.envoyproxy.io/)
-- [FastAPI Documentation](https://fastapi.tiangolo.com)
+```
+app/
+  main.py              # FastAPI entrypoint (:8001)
+  config.py            # Loads policy.yaml
+  api/routes/
+    health.py          # GET /health
+    mcp.py             # POST /mcp  (main entry point)
+  auth/
+    token_auth.py      # Token extraction + lookup
+    models.py          # Principal dataclass
+  mcp/
+    dispatcher.py      # Request orchestration (auth → policy → audit → upstream)
+    protocol.py        # JSON-RPC types
+    registry.py        # Upstream server registry
+    upstream.py        # httpx forwarding client
+    adapters/          # Pluggable upstream adapters
+  policy/
+    engine.py          # Tool allow/deny + tools/list filtering
+    errors.py          # Policy error types
+  observability/
+    audit.py           # Structured audit emission
+    context.py         # Per-request trace context
+  safety/
+    idempotency.py     # Mutating-tool deduplication
+
+cmd/
+  upstream/main.py     # Mock tool server (:9001)
+  stdio_bridge/main.py # Claude Desktop ↔ nom-py bridge
+  client/main.py       # CLI test client
+
+config/
+  policy.yaml          # Tokens, groups, tool permissions, upstream endpoint
+
+docs/
+  phase1_architecture_understanding.md
+  phase2_mcp_core_flow.md
+  phase3_auth_and_policy.md
+  phase4_governance_observability.md
+  phase5_guardrails.md
+```
+
+---
+
+## Dependencies
+
+```
+fastapi        # Web framework
+uvicorn        # ASGI server
+httpx          # Async HTTP client (upstream forwarding)
+pyyaml         # Policy config loading
+pydantic       # Request/response validation
+python-dotenv  # Environment variable loading
+pytest         # Test runner
+```
+
+---
+
+## What is NOT yet implemented
+
+- **GitHub OAuth / OBO auth** — token auth is static config-based (Phase 6+)
+- **Concurrent-request safety at real scale** — not load-tested
+- **Multi-tenant isolation beyond token-mapped groups**
+- **Compatibility with MCP clients other than Claude Desktop**
+- **Production TLS / secrets management**

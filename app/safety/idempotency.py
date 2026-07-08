@@ -1,7 +1,6 @@
-﻿"""
-Idempotency -- prevents duplicate mutating tool calls.
 """
-import asyncio
+Idempotency — prevents duplicate mutating tool calls.
+"""
 import hashlib
 import json
 import time
@@ -19,29 +18,12 @@ class IdempotencyStore:
     def __init__(self, ttl_seconds: int = 3600):
         self._store: dict[str, IdempotencyEntry] = {}
         self.ttl = ttl_seconds
-        self._key_locks: dict[str, asyncio.Lock] = {}
-
-    def lock_for(self, key: str) -> asyncio.Lock:
-        """Get-or-create a per-key asyncio lock.
-
-        Safe without a meta-lock because asyncio is single-threaded:
-        no two coroutines can interleave at this point.
-        """
-        if key not in self._key_locks:
-            self._key_locks[key] = asyncio.Lock()
-        return self._key_locks[key]
 
     def key_for(self, user_id: str, tool: str, args: dict, explicit_key: str | None) -> str:
-        """Produce a canonical idempotency key.
-
-        Uses sort_keys=True and compact separators so that arg dicts
-        with the same entries in different insertion order hash identically.
-        """
         if explicit_key:
             return f"{user_id}:{tool}:{explicit_key}"
-        canonical_args = json.dumps(args, sort_keys=True, separators=(',', ':'))
-        key_input = f"{user_id}:{tool}:{canonical_args}"
-        return hashlib.sha256(key_input.encode()).hexdigest()[:32]
+        payload = json.dumps({"u": user_id, "t": tool, "a": args}, sort_keys=True)
+        return hashlib.sha256(payload.encode()).hexdigest()[:32]
 
     def get(self, key: str) -> dict[str, Any] | None:
         entry = self._store.get(key)
