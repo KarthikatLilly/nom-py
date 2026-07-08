@@ -288,6 +288,90 @@ A policy denial short-circuits at `policy.evaluate` — `upstream.call` is absen
 
 ---
 
+## Idempotency — proof from audit logs
+
+Mutating tools (`mutating: true` in `policy.yaml`) are deduplicated: the same call with the same arguments only reaches the upstream once. Subsequent identical calls return the cached result.
+
+The idempotency key is `SHA-256(user_id + tool_name + args)[:32]`. Same inputs always produce the same key regardless of `request_id`.
+
+### How it was tested
+
+`delete_user` is globally denied by default. To test idempotency, `allow: true` was temporarily set in `config/policy.yaml`. The same call was sent three times.
+
+---
+
+### Call 1 — `idempotency.miss` (upstream executed, result cached)
+
+```json
+{
+  "request_id": "be7d14ce-323c-4ade-8dc3-c5d36712ba68",
+  "user_id": "alice",
+  "method": "tools/call",
+  "duration_ms": 262.14,
+  "events": [
+    { "stage": "auth.extract",      "t_ms": 0.02, "source": "body",   "found": true },
+    { "stage": "auth.lookup",       "t_ms": 0.04, "token_hint": "tok-al…", "result": "ok" },
+    { "stage": "policy.evaluate",   "t_ms": 0.35, "tool": "delete_user", "decision": "allow" },
+    { "stage": "safety.revertible", "t_ms": 0.36, "mutating": true, "revertible": false },
+    { "stage": "idempotency.miss",  "t_ms": 0.77, "key": "2f54dd9e53f3d464eb193c631d527bbb" },
+    { "stage": "upstream.call",     "t_ms": 262.12, "latency_ms": 261.3, "status": 200 },
+    { "stage": "dispatch.complete", "t_ms": 262.14, "outcome": "ok" }
+  ]
+}
+```
+
+`idempotency.miss` → key not in cache → upstream called (262ms) → result stored under key `2f54dd9e…`.
+
+---
+
+### Calls 2 & 3 — `idempotency.hit` (upstream NOT called, cached result returned)
+
+```json
+{
+  "request_id": "be840984-a68e-487b-a863-7fa2bffedaf6",
+  "user_id": "alice",
+  "duration_ms": 0.39,
+  "events": [
+    { "stage": "auth.extract",      "t_ms": 0.02 },
+    { "stage": "auth.lookup",       "t_ms": 0.04, "result": "ok" },
+    { "stage": "policy.evaluate",   "t_ms": 0.26, "decision": "allow" },
+    { "stage": "safety.revertible", "t_ms": 0.26, "mutating": true },
+    { "stage": "idempotency.hit",   "t_ms": 0.39, "key": "2f54dd9e53f3d464eb193c631d527bbb" },
+    { "stage": "dispatch.complete", "t_ms": 0.39, "outcome": "ok" }
+  ]
+}
+```
+
+`idempotency.hit` → key found in cache → pipeline exited before `upstream.call`. `upstream.call` is **absent** from the audit. `duration_ms: 0.39ms` vs 262ms for the miss.
+
+---
+
+### Miss vs hit — side by side
+
+| | Call 1 — miss | Call 2 — hit | Call 3 — hit |
+|---|---|---|---|
+| `duration_ms` | **262.14ms** | **0.39ms** | **0.69ms** |
+| `upstream.call` present | ✅ yes (261ms) | ❌ no | ❌ no |
+| `idempotency` event | `miss` | `hit` | `hit` |
+| Idempotency key | `2f54dd9e…` | `2f54dd9e…` (same) | `2f54dd9e…` (same) |
+| Upstream actually called | yes | **no** | **no** |
+
+The upstream received exactly **one** `delete_user` call. Calls 2 and 3 were served entirely from the nom-py cache — the side effect was not repeated.
+
+---
+
+### Read-only tools bypass idempotency entirely
+
+Sending `get_weather` twice:
+
+```json
+{ "stage": "safety.revertible", "mutating": false, "revertible": false }
+```
+
+No `idempotency.miss` or `idempotency.hit` event appears. `upstream.call` is present on both calls — read-only tools always hit the upstream. The `mutating: false` flag in `safety.revertible` is the gate that skips the idempotency block entirely.
+
+---
+
 ## Project structure
 
 ```
