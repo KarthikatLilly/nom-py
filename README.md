@@ -10,7 +10,7 @@
 
 **nom-py** is a Python implementation of NOM, ported from an internal Go codebase. NOM is inspired by the [Envoy proxy](https://www.envoyproxy.io/) but purpose-built for AI agents and the Model Context Protocol (MCP).
 
-When AI agents (such as Claude, Copilot, or Cortex agents) need to use tools, they should not connect directly to every tool server. They connect to one gateway — NOM — which handles authentication, authorization, auditing, and safety guardrails, then forwards the call to the correct upstream tool server.
+When AI agents (such as Claude, Copilot, or Cortex agents) need to use tools, they should not connect directly to every tool server. They connect to one gateway — (NOM) — which handles authentication, authorization, auditing, and safety guardrails, then forwards the call to the correct upstream tool server.
 
 NOM acts as the single enforcement point for all AI-to-tool traffic.
 
