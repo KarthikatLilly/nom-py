@@ -372,6 +372,27 @@ No `idempotency.miss` or `idempotency.hit` event appears. `upstream.call` is pre
 
 ---
 
+## Running the tests
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests/ -v -p no:debugging
+```
+
+`-p no:debugging` is required on this machine — the top-level `cmd/` package (the stdio bridge, upstream mock, and CLI client) shadows Python's stdlib `cmd` module, which pytest's `--pdb` support imports on startup. Disabling that plugin avoids the collision. `tests/conftest.py` adds the repo root to `sys.path` so `from app...` imports resolve regardless of which pytest entrypoint invokes it.
+
+Covers `test_ttl_expiry` (TTL eviction) and `test_concurrent_mutating_calls_are_serialised` (the `IdempotencyStore.lock_for` mutex fix — proves concurrent identical mutating calls hit upstream exactly once).
+
+To confirm the mutex test actually catches a regression, revert the fix and re-run it:
+
+```powershell
+git stash                                              # temporarily removes the lock_for fix
+.venv\Scripts\python.exe -m pytest tests/test_dispatcher_idempotency.py -v -p no:debugging
+# expect: FAILED — AttributeError: 'IdempotencyStore' object has no attribute 'lock_for'
+git stash pop                                          # restore the fix
+```
+
+---
+
 ## Project structure
 
 ```
@@ -434,7 +455,7 @@ pytest         # Test runner
 ## What is NOT yet implemented
 
 - **GitHub OAuth / OBO auth** — token auth is static config-based (Phase 6+)
-- **Concurrent-request safety at real scale** — not load-tested
+- **Concurrent-request safety at real scale** — the per-key `asyncio.Lock` in `IdempotencyStore` is unit-tested (see [Running the tests](#running-the-tests)) but not load-tested under production traffic
 - **Multi-tenant isolation beyond token-mapped groups**
 - **Compatibility with MCP clients other than Claude Desktop**
 - **Production TLS / secrets management**

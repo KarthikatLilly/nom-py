@@ -588,6 +588,49 @@ Matches the Test C2 intent and makes the mutating vs read-only split explicit in
 
 ---
 
+## 🔒 Idempotency lock + duplicate audit fix (post-4.1 code review)
+
+A code review pass over the committed 4.1 code found two defects between what this doc
+described and what was actually in `main`:
+
+- **`IdempotencyStore.lock_for` did not exist.** Fix 2 above documents the lock-based
+  TOCTOU fix, but the method itself was never added to `app/safety/idempotency.py` —
+  only `key_for`, `get`, and `put` were defined. Any mutating tool call
+  (`create_bucket`, `delete_user` with `allow: true`, etc.) raised
+  `AttributeError: 'IdempotencyStore' object has no attribute 'lock_for'` at the
+  `async with self.idempotency.lock_for(idempotency_key):` line in
+  `app/mcp/dispatcher.py`. `tests/test_idempotency_ttl.py` only exercises `put`/`get`/TTL,
+  so it never caught this.
+- **`app/api/routes/mcp.py` called `audit.emit(ctx)` twice** in the request's `finally`
+  block, doubling every audit record.
+
+**Fix:** `lock_for(key)` now lazily creates and caches an `asyncio.Lock` per key in a new
+`self._locks` dict, so the existing `async with` usage in the dispatcher works as
+originally documented. The duplicate `audit.emit(ctx)` call was removed.
+
+**Regression test:** `tests/test_dispatcher_idempotency.py` fires two concurrent
+identical `create_bucket` calls through `MCPDispatcher` against a fake upstream and
+asserts the upstream is hit exactly once. Confirmed this test fails with the exact
+`AttributeError` above when the `lock_for` fix is reverted (`git stash`), and passes
+once restored — so it's a real regression guard for the gap this review found, not just
+a happy-path check.
+
+### Running the tests
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests/ -v -p no:debugging
+```
+
+`-p no:debugging` is required — the top-level `cmd/` package (stdio bridge, upstream
+mock, CLI client) shadows the stdlib `cmd` module that pytest's `--pdb` support imports,
+which otherwise crashes collection entirely. `tests/conftest.py` appends the repo root to
+`sys.path` so `from app...` imports resolve regardless of entrypoint (`pytest.exe` vs
+`python -m pytest`).
+
+Expected: `2 passed` — `test_ttl_expiry` and `test_concurrent_mutating_calls_are_serialised`.
+
+---
+
 ## 📊 Phase summary
 
 | Layer | Phase | Status |
@@ -597,4 +640,5 @@ Matches the Test C2 intent and makes the mutating vs read-only split explicit in
 | Token auth + policy | 3 | ✅ |
 | Audit stream + idempotency + revert metadata | 4 | ✅ |
 | Idempotency hardening (canonical key, lock, error-safe) | 4.1 | ✅ |
+| `lock_for` implementation + duplicate-audit fix (code review) | 4.2 | ✅ |
 | GitHub OAuth + Claude Desktop bridge + demo | 5 | ⏭️ Next |

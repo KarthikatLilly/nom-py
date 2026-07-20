@@ -1,6 +1,7 @@
 """
 Idempotency — prevents duplicate mutating tool calls.
 """
+import asyncio
 import hashlib
 import json
 import time
@@ -17,7 +18,15 @@ class IdempotencyEntry:
 class IdempotencyStore:
     def __init__(self, ttl_seconds: int = 3600):
         self._store: dict[str, IdempotencyEntry] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
         self.ttl = ttl_seconds
+
+    def lock_for(self, key: str) -> asyncio.Lock:
+        lock = self._locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[key] = lock
+        return lock
 
     def key_for(self, user_id: str, tool: str, args: dict, explicit_key: str | None) -> str:
         if explicit_key:

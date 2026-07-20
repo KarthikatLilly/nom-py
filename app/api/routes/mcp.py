@@ -66,4 +66,3 @@ async def mcp_entry(body: MCPRequest, request: Request):
         return result
     finally:
         audit.emit(ctx)
-        audit.emit(ctx)
