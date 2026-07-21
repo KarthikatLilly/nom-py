@@ -10,7 +10,10 @@ import asyncio
 import pytest
 
 from app.auth.models import Principal
+from app.auth.providers.pat import GitHubPATProvider
+from app.auth.providers.registry import ProviderRegistry
 from app.mcp.dispatcher import MCPDispatcher
+from app.mcp.server_registry import ServerConfig, ServerRegistry
 from app.policy.engine import PolicyEngine
 
 
@@ -18,7 +21,7 @@ class FakeUpstream:
     def __init__(self):
         self.calls = 0
 
-    async def forward(self, msg, ctx=None):
+    async def forward(self, url, msg, headers=None, ctx=None):
         self.calls += 1
         await asyncio.sleep(0.05)  # widen the race window
         return {"jsonrpc": "2.0", "id": msg.get("id"), "result": {"ok": True}}
@@ -32,14 +35,22 @@ class FakePolicy(PolicyEngine):
 @pytest.mark.asyncio
 async def test_concurrent_mutating_calls_are_serialised():
     upstream = FakeUpstream()
-    dispatcher = MCPDispatcher(upstream=upstream, policy=FakePolicy())
-    principal = Principal(user_id="u1", groups=[])
+    servers = ServerRegistry({
+        "github": ServerConfig(name="github", url="http://fake/mcp", namespace="github", auth_mode="pat"),
+    })
+    dispatcher = MCPDispatcher(
+        upstream=upstream,
+        policy=FakePolicy(),
+        servers=servers,
+        providers=ProviderRegistry({"pat": GitHubPATProvider()}),
+    )
+    principal = Principal(user_id="alice", groups=[])
 
     msg = {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
-        "params": {"name": "create_bucket", "arguments": {"name": "b1"}},
+        "params": {"name": "github__create_bucket", "arguments": {"name": "b1"}},
     }
 
     results = await asyncio.gather(

@@ -6,12 +6,18 @@ Handles JSON-RPC methods:
 - tools/list
 - tools/call
 
-Enforces auth and policy before forwarding to the upstream.
+Enforces auth and policy before forwarding to the upstream, and resolves a
+per-upstream outbound credential (see app/auth/providers) before every
+tools/call — read-only tools included.
 """
 import logging
 from typing import Any
 
 from app.auth.models import Principal
+from app.auth.providers.base import ConfigError
+from app.auth.providers.registry import ProviderRegistry, default_registry
+from app.config import settings
+from app.mcp.server_registry import ServerRegistry, load_server_registry
 from app.mcp.upstream import UpstreamClient
 from app.policy.engine import PolicyEngine
 from app.policy.errors import PolicyDenied
@@ -21,10 +27,19 @@ logger = logging.getLogger(__name__)
 
 
 class MCPDispatcher:
-    def __init__(self, upstream: UpstreamClient, policy: PolicyEngine, idempotency: IdempotencyStore | None = None):
+    def __init__(
+        self,
+        upstream: UpstreamClient,
+        policy: PolicyEngine,
+        idempotency: IdempotencyStore | None = None,
+        servers: ServerRegistry | None = None,
+        providers: ProviderRegistry | None = None,
+    ):
         self.upstream = upstream
         self.policy = policy
         self.idempotency = idempotency or IdempotencyStore()
+        self.servers = servers or load_server_registry()
+        self.providers = providers or default_registry()
 
     async def handle(
         self, msg: dict[str, Any], principal: Principal, ctx=None
@@ -64,7 +79,7 @@ class MCPDispatcher:
         return result
 
     async def _handle_initialize(self, msg: dict[str, Any], ctx=None) -> dict[str, Any]:
-        upstream_result = await self.upstream.forward(msg, ctx)
+        upstream_result = await self.upstream.forward(settings.upstream_endpoint, msg, ctx=ctx)
         if "result" in upstream_result:
             upstream_result["result"]["serverInfo"] = {
                 "name": "nom-py",
@@ -78,7 +93,7 @@ class MCPDispatcher:
     async def _handle_tools_list(
         self, msg: dict[str, Any], principal: Principal, ctx=None
     ) -> dict[str, Any]:
-        upstream_result = await self.upstream.forward(msg, ctx)
+        upstream_result = await self.upstream.forward(settings.upstream_endpoint, msg, ctx=ctx)
         if "result" in upstream_result and "tools" in upstream_result["result"]:
             all_tools = upstream_result["result"]["tools"]
             filtered = self.policy.filter_tools_list(principal, all_tools)
@@ -89,43 +104,83 @@ class MCPDispatcher:
         self, msg: dict[str, Any], principal: Principal, ctx=None
     ) -> dict[str, Any]:
         params = msg.get("params", {}) or {}
-        tool_name = params.get("name", "")
+        exposed_name = params.get("name", "")
         args = params.get("arguments", {}) or {}
 
+        # 1. Resolve routing first — an unknown/unnamespaced tool is a client error,
+        #    not a policy or credential decision.
         try:
-            self.policy.evaluate_tool_call(principal, tool_name, ctx)
+            route, original_name = self.servers.resolve(exposed_name)
+        except ConfigError as e:
+            return self._error(msg.get("id"), -32602, str(e))
+
+        # 2. Policy decides before any credential is touched — a denied call must
+        #    never cause a provider (secret store, vault, token minter) to be invoked.
+        #    Rules are keyed by the tool's original (un-namespaced) name — the same
+        #    tool is governed by the same rule no matter which upstream exposes it.
+        try:
+            self.policy.evaluate_tool_call(principal, original_name, ctx)
         except PolicyDenied as e:
             return self._error(msg.get("id"), e.code, str(e))
 
-        rule = self.policy.rules.get(tool_name, {})
+        # 3. Only an allowed call gets a provider looked up...
+        try:
+            provider = self.providers.for_upstream(route)
+        except ConfigError as e:
+            return self._error(msg.get("id"), -32000, str(e))
 
-        if not rule.get("mutating"):
-            # Read-only tool — forward directly, no idempotency overhead
-            return await self.upstream.forward(msg, ctx)
-
-        # Mutating tool — serialise concurrent identical calls under a per-key lock
-        idempotency_key = self.idempotency.key_for(
-            principal.user_id,
-            tool_name,
-            args,
-            params.get("idempotency_key"),
-        )
-        async with self.idempotency.lock_for(idempotency_key):
-            cached = self.idempotency.get(idempotency_key)
-            if cached:
-                if ctx is not None:
-                    ctx.record("idempotency.hit", key=idempotency_key)
-                return cached
+        # 4. ...and only a resolved credential may proceed. Any failure here means
+        #    we FAIL CLOSED: never forward to the upstream unauthenticated.
+        try:
+            cred = await provider.get_upstream_credentials(principal, route)
+        except Exception as e:
+            logger.error("Credential resolution failed: upstream=%s error=%s", route.name, e)
             if ctx is not None:
-                ctx.record("idempotency.miss", key=idempotency_key)
+                ctx.record("credential.failed", upstream=route.name, error=str(e))
+            return self._error(msg.get("id"), -32000, f"Credential resolution failed for '{route.name}'")
 
-            result = await self.upstream.forward(msg, ctx)
+        if ctx is not None:
+            # Record the lease_id (an audit reference) — never cred.headers or the secret.
+            ctx.record(
+                "credential.resolved",
+                provider=type(provider).__name__,
+                upstream=route.name,
+                lease_id=cred.lease_id,
+            )
 
-            # Only cache confirmed successes — never persist upstream errors
-            if "error" not in result:
-                self.idempotency.put(idempotency_key, result)
+        rule = self.policy.rules.get(original_name, {})
+        forward_msg = {**msg, "params": {**params, "name": original_name}}
 
-        return result
+        try:
+            if not rule.get("mutating"):
+                # Read-only tool — forward directly, no idempotency overhead
+                return await self.upstream.forward(route.url, forward_msg, headers=cred.headers, ctx=ctx)
+
+            # Mutating tool — serialise concurrent identical calls under a per-key lock
+            idempotency_key = self.idempotency.key_for(
+                principal.user_id,
+                exposed_name,  # per-upstream identity: same tool name on two upstreams != same op
+                args,
+                params.get("idempotency_key"),
+            )
+            async with self.idempotency.lock_for(idempotency_key):
+                cached = self.idempotency.get(idempotency_key)
+                if cached:
+                    if ctx is not None:
+                        ctx.record("idempotency.hit", key=idempotency_key)
+                    return cached
+                if ctx is not None:
+                    ctx.record("idempotency.miss", key=idempotency_key)
+
+                result = await self.upstream.forward(route.url, forward_msg, headers=cred.headers, ctx=ctx)
+
+                # Only cache confirmed successes — never persist upstream errors
+                if "error" not in result:
+                    self.idempotency.put(idempotency_key, result)
+
+            return result
+        finally:
+            await provider.release(cred)
 
     @staticmethod
     def _error(msg_id: Any, code: int, message: str) -> dict[str, Any]:

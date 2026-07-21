@@ -61,7 +61,7 @@ Result: one endpoint, one auth model, one policy engine, one audit log — regar
 
 ---
 
-## What has been built (Phases 1–5)
+## What has been built (Phases 1–6)
 
 ### Phase 1 — Scaffold
 FastAPI app, `/health` and `/mcp` routes, uvicorn boot, basic request flow.
@@ -96,6 +96,10 @@ Idempotency: mutating tools replay cached results for duplicate requests (keyed 
 A thin translation shim (`cmd/stdio_bridge/main.py`) lets stdio-only MCP clients (such as Claude Desktop) talk to nom-py's HTTP interface. nom-py itself was not modified — the bridge is 100% transport translation.
 
 The bridge reads JSON-RPC from stdin, POSTs to nom-py with an injected `Authorization: Bearer` token, and writes responses to stdout. All logs go to stderr so Claude's parser is never confused.
+
+### Phase 6 — outbound credentials (AuthProvider layer)
+
+Phases 1–5 only answered "who is calling nom-py?" (inbound identity — `Principal`). Phase 6 adds the other half: "how does nom-py authenticate to the upstream as that user?" — see [Outbound credentials (Phase 6)](#outbound-credentials-phase-6) below.
 
 ---
 
@@ -263,6 +267,100 @@ After running → fully restart Claude Desktop (system tray → Quit → relaunc
 
 ---
 
+## Outbound credentials (Phase 6)
+
+Everything above answers **inbound identity**: which caller is talking to nom-py, and what are they allowed to do (`Principal`, tokens, `policy.yaml`). Phase 6 answers a separate question that Phases 1–5 left unaddressed:
+
+> Once nom-py has decided a call is allowed, **what credential does it present to the upstream** so the call actually authenticates as that user?
+
+These are deliberately kept as two independent layers:
+
+| Question | Layer | Where it lives |
+|---|---|---|
+| Who is calling nom-py? | Inbound identity | `Principal`, `token_auth.py` — **unchanged in Phase 6** |
+| Is this call allowed? | Policy | `PolicyEngine`, `policy.yaml` — **unchanged in Phase 6** |
+| How does nom-py call the upstream _as this user_? | Outbound credential | `AuthProvider` — **new in Phase 6** |
+
+### Why a provider abstraction instead of if/elif
+
+Real deployments route to many upstreams, and each one authenticates differently — a personal access token, an OAuth-refreshed token, an impersonated short-lived token, a vault-leased secret. Without an abstraction, the dispatcher would grow an `if upstream == "github": ... elif upstream == "google": ...` ladder — one that gets worse with every new upstream and mixes routing logic with credential logic.
+
+Instead, every upstream declares an `auth_mode` in `config/servers.yaml`, and a `ProviderRegistry` does a single dict lookup from that mode to an `AuthProvider` implementation. The dispatcher only ever calls the `AuthProvider` interface — it has no idea whether the credential underneath came from a secret store, an OAuth token endpoint, or a vault lease.
+
+### The four auth modes
+
+| `auth_mode` | Provider | Credential shape | Refresh behavior |
+|---|---|---|---|
+| `pat` | `GitHubPATProvider` | Long-lived personal access token | None — static secret |
+| `oauth` | `GoogleOAuthProvider` | Short-lived OAuth access token | Cached until expiry, minted again on expiry |
+| `cli` | `GCPCLIProvider` | Impersonated short-lived token | Minted fresh per call, never a local CLI session |
+| `ca` | `EnterpriseCAProvider` | Vault-leased secret + `lease_id` | Leased per call, released after use |
+
+This is a local demo: every provider talks to a **fake** in-process client (`FakeSecretStore`, `FakeOAuthTokenEndpoint`, `FakeTokenMinter`, `FakeVaultClient`) instead of a real external system. Every place a real SDK call belongs is marked with a `# REAL: replace with <sdk call>` comment, so the swap-in point for production credentials is explicit and searchable.
+
+### Request flow (the security-critical order)
+
+```
+tools/call "github__get_weather"
+        │
+        ▼
+1. server_registry.resolve()   →  strip "github__" prefix → (ServerConfig, "get_weather")
+        │  unknown namespace → -32602, nothing else runs
+        ▼
+2. policy.evaluate_tool_call()  →  allow/deny on the ORIGINAL tool name
+        │  denied → return policy error, AuthProvider is NEVER touched
+        ▼
+3. providers.for_upstream()     →  dict lookup on auth_mode
+        │  unknown auth_mode → ConfigError, fail closed
+        ▼
+4. provider.get_upstream_credentials()
+        │  raises → -32000 error, upstream.forward() is NEVER called
+        ▼
+5. ctx.record("credential.resolved", lease_id=...)   ← lease_id only, never the secret
+        ▼
+6. upstream.forward(url, headers=cred.headers)   →  finally: provider.release(cred)
+```
+
+Steps 3–6 run for **every** tool, including read-only ones — a credential is resolved whether or not the call mutates anything. Only step 6's idempotency wrapping is conditional on `mutating: true`.
+
+This order is a security invariant, not an implementation detail:
+
+- **Policy before credentials** — a denied call must never cause a secret store, OAuth endpoint, or vault to be touched.
+- **Fail closed** — any exception while resolving a credential aborts the request; nom-py never forwards a tool call to an upstream without a credential attached.
+- **Audit the reference, never the secret** — `ctx.record("credential.resolved", ...)` stores `lease_id`, never `cred.headers` or the raw token/secret.
+- **Release is unconditional** — `provider.release(cred)` runs in a `finally`, so a vault lease is invalidated whether the upstream call succeeds or raises.
+
+### Configuring an upstream (`config/servers.yaml`)
+
+```yaml
+servers:
+  github:
+    url: "http://localhost:9001/mcp"
+    namespace: "github"
+    auth_mode: "pat"
+
+  internal:
+    url: "http://localhost:9001/mcp"
+    namespace: "internal"
+    auth_mode: "ca"
+    vault_safe: "MCP-Internal-CA"     # ca-only: which vault safe to lease from
+```
+
+Tools are exposed to callers as `"<namespace>__<tool_name>"` (e.g. `github__list_repos`) so a single flat `tools/list` can mix tools from multiple upstreams without name collisions. `server_registry.resolve()` strips the prefix before forwarding, so the upstream always receives its own original tool name.
+
+### Enterprise CA is different from the other three
+
+`pat`, `oauth`, and `cli` all resolve to a token that gets handed over and forgotten. The `ca` mode (an enterprise credential-vaulting system — think CyberArk-style dynamic secrets) is structurally different in two ways:
+
+1. **It issues a lease, not just a token.** `EnterpriseCAProvider.get_upstream_credentials()` returns a `lease_id` alongside the header — an audit reference that identifies _which checkout_ was used, independent of the secret's value.
+2. **It must be explicitly released.** Every other provider's `release()` is a no-op. `EnterpriseCAProvider.release()` calls back into the vault to invalidate the lease, and the dispatcher guarantees this runs via `finally` — on the success path and the failure path alike. A vault lease that's checked out but never released is a live credential sitting outside the vault's control; Phase 6 treats "forgot to release" as a bug, not a cleanup nicety.
+
+In short: PAT/OAuth/CLI are "get me a token," while CA is "check out a credential, use it, and prove you checked it back in" — and the dispatcher's `try/finally` around step 6 exists specifically to make that checkout/return cycle unconditional.
+
+See [docs/phase6_auth_layer.md](docs/phase6_auth_layer.md) for the full walkthrough, including how each provider is wired to its fake backend and the test suite that proves the security ordering above.
+
+---
+
 ## Audit log format
 
 Every request produces one JSON line on `nom-py.audit`:
@@ -403,13 +501,22 @@ app/
     health.py          # GET /health
     mcp.py             # POST /mcp  (main entry point)
   auth/
-    token_auth.py      # Token extraction + lookup
+    token_auth.py      # Token extraction + lookup (inbound identity)
     models.py          # Principal dataclass
+    providers/          # Outbound credential resolution (Phase 6)
+      base.py           # AuthProvider ABC, UpstreamCredential, ConfigError
+      pat.py            # GitHubPATProvider
+      oauth.py          # GoogleOAuthProvider
+      cli.py            # GCPCLIProvider
+      ca.py             # EnterpriseCAProvider
+      registry.py       # ProviderRegistry — auth_mode -> AuthProvider
+      fakes.py          # Fake secret store / token endpoint / minter / vault
   mcp/
-    dispatcher.py      # Request orchestration (auth → policy → audit → upstream)
+    dispatcher.py      # Request orchestration (route → policy → credential → upstream)
     protocol.py        # JSON-RPC types
-    registry.py        # Upstream server registry
-    upstream.py        # httpx forwarding client
+    registry.py        # Upstream server registry (legacy, adapter-based)
+    server_registry.py # ServerConfig/ServerRegistry — namespaced tool routing (Phase 6)
+    upstream.py        # httpx forwarding client (per-call url + headers)
     adapters/          # Pluggable upstream adapters
   policy/
     engine.py          # Tool allow/deny + tools/list filtering
@@ -427,6 +534,7 @@ cmd/
 
 config/
   policy.yaml          # Tokens, groups, tool permissions, upstream endpoint
+  servers.yaml         # Upstream servers, namespaces, auth_mode (Phase 6)
 
 docs/
   phase1_architecture_understanding.md
@@ -434,6 +542,7 @@ docs/
   phase3_auth_and_policy.md
   phase4_governance_observability.md
   phase5_guardrails.md
+  phase6_auth_layer.md
 ```
 
 ---
@@ -454,7 +563,8 @@ pytest         # Test runner
 
 ## What is NOT yet implemented
 
-- **GitHub OAuth / OBO auth** — token auth is static config-based (Phase 6+)
+- **Real upstream SDK calls** — every Phase 6 provider talks to a fake in-process client; each `# REAL:` comment marks where a real GitHub/Google/GCP/enterprise-vault SDK call would go
+- **Per-user OAuth refresh-token storage** — `GoogleOAuthProvider` mints against a fake endpoint; real use needs a persisted refresh token per user
 - **Concurrent-request safety at real scale** — the per-key `asyncio.Lock` in `IdempotencyStore` is unit-tested (see [Running the tests](#running-the-tests)) but not load-tested under production traffic
 - **Multi-tenant isolation beyond token-mapped groups**
 - **Compatibility with MCP clients other than Claude Desktop**

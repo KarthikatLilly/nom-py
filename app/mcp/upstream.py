@@ -1,5 +1,7 @@
 """
-UpstreamClient — forwards MCP JSON-RPC messages to the configured upstream.
+UpstreamClient — forwards MCP JSON-RPC messages to a per-call upstream URL,
+attaching whatever outbound credential headers the caller has already
+resolved for that upstream.
 """
 import logging
 import time
@@ -11,16 +13,21 @@ logger = logging.getLogger(__name__)
 
 
 class UpstreamClient:
-    def __init__(self, endpoint: str, timeout: float = 15.0):
-        self.endpoint = endpoint
+    def __init__(self, timeout: float = 15.0):
         self.timeout = timeout
         self._client = httpx.AsyncClient(timeout=timeout)
 
-    async def forward(self, msg: dict[str, Any], ctx=None) -> dict[str, Any]:
-        logger.debug("Forwarding to upstream: %s", self.endpoint)
+    async def forward(
+        self,
+        url: str,
+        msg: dict[str, Any],
+        headers: dict[str, str] | None = None,
+        ctx=None,
+    ) -> dict[str, Any]:
+        logger.debug("Forwarding to upstream: %s", url)
         try:
             t0 = time.monotonic()
-            response = await self._client.post(self.endpoint, json=msg)
+            response = await self._client.post(url, json=msg, headers=headers)
             if ctx is not None:
                 ctx.record(
                     "upstream.call",

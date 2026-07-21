@@ -1,0 +1,28 @@
+# Upstream MCP servers reachable through nom-py.
+#
+# Each tool exposed by nom-py is namespaced as "<namespace>__<tool_name>" so
+# tools from multiple upstreams can share one flat tools/list without name
+# collisions. auth_mode selects which AuthProvider resolves outbound
+# credentials for calls to that server (see app/auth/providers/registry.py).
+servers:
+  github:
+    url: "http://localhost:9001/mcp"
+    namespace: "github"
+    auth_mode: "pat"
+
+  google:
+    url: "http://localhost:9001/mcp"
+    namespace: "google"
+    auth_mode: "oauth"
+
+  gcp:
+    url: "http://localhost:9001/mcp"
+    namespace: "gcp"
+    auth_mode: "cli"
+    service_account: "nom-gcp-runner@example-project.iam.gserviceaccount.com"
+
+  internal:
+    url: "http://localhost:9001/mcp"
+    namespace: "internal"
+    auth_mode: "ca"
+    vault_safe: "MCP-Internal-CA"

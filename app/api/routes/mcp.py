@@ -8,7 +8,6 @@ from pydantic import BaseModel, ConfigDict
 
 from app.auth.models import Principal
 from app.auth.token_auth import authenticate, AuthError
-from app.config import settings
 from app.mcp.dispatcher import MCPDispatcher
 from app.mcp.upstream import UpstreamClient
 from app.observability import audit
@@ -17,7 +16,7 @@ from app.policy.engine import PolicyEngine
 
 router = APIRouter()
 
-_upstream = UpstreamClient(endpoint=settings.upstream_endpoint)
+_upstream = UpstreamClient()
 _policy = PolicyEngine()
 _dispatcher = MCPDispatcher(upstream=_upstream, policy=_policy)
 

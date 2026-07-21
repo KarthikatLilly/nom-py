@@ -444,4 +444,4 @@ deliberate policy changes.
 | Token auth + policy enforcement | 3 | ✅ |
 | Audit stream + idempotency + revert metadata | 4 | ✅ |
 | stdio bridge + Claude Desktop integration | 5 | ✅ |
-| GitHub OAuth + production hardening | 6 | ⏭ Next |
+| Outbound credentials — AuthProvider layer (pat/oauth/cli/ca) | 6 | ✅ |
